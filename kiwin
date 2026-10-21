@@ -1,0 +1,2 @@
+# Kiwin Execution Platform
+sudo /usr/bin/bun kiwin.ts $1 $2

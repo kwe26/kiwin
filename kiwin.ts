@@ -90,6 +90,7 @@ const [cmd, ...args] = process.argv.slice(2);
 switch (cmd) {
   case "daemon": {
     const { runDaemon } = await import("./src/daemon");
+    
     await runDaemon();
     break;
   }
