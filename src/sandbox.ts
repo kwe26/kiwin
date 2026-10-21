@@ -73,11 +73,18 @@ export function bwrapArgs(cfg: KiwinConfig): string[] {
   for (const t of cfg.tmpfs) args.push("--tmpfs", t);
   for (const b of cfg.binds) {
     args.push(b.ro ? "--ro-bind" : "--bind", b.src, b.dest);
-    // Never expose kiwin itself (daemon code, ssh host key, rootfs) to the
-    // isolation, otherwise root inside could rewrite code the host runs as root.
-    const rel = relative(b.src, ROOT);
-    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
-      args.push("--tmpfs", join(b.dest, rel));
+    // kiwin's own directory stays visible but read-only (root inside must not
+    // rewrite code the host runs as root); the rootfs and state (ssh host key,
+    // control sockets) are hidden entirely.
+    const inside = (p: string) => {
+      const rel = relative(b.src, p);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? join(b.dest, rel) : null;
+    };
+    const kiwin = inside(ROOT);
+    if (kiwin) args.push("--ro-bind", ROOT, kiwin);
+    for (const hidden of [cfg.rootfs, cfg.stateDir]) {
+      const at = inside(hidden);
+      if (at) args.push("--tmpfs", at);
     }
   }
   args.push(

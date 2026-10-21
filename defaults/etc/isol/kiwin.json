@@ -1,0 +1,13 @@
+{
+  "description": "kiwin web server",
+  "exec": ["/mount/www/kiwin/kiwi/kiwin"],
+  "executableDir": "/mount/www/kiwin/kiwi",
+  "pre": [],
+  "reload": [],
+  "reloadSignal": "SIGHUP",
+  "enabled": true,
+  "restart": "always",
+  "restartSec": 2,
+  "stopSignal": "SIGQUIT",
+  "stopTimeout": 15
+}

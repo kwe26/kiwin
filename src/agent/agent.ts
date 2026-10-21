@@ -5,7 +5,7 @@
 // This file must stay dependency-free: it runs on the isolation's own bun.
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { Subprocess } from "bun";
 
 const SOCKET = process.env.KIWIN_SOCKET ?? "/run/kiwin/ctl/agent.sock";
@@ -30,6 +30,12 @@ interface UnitDef {
   reloadSignal?: string;
   reload?: Cmd;
   cwd?: string;
+  /**
+   * Directory the executable lives in. Commands run there (unless `cwd` is
+   * set), relative executables like "./server" resolve against it, and it is
+   * prepended to PATH.
+   */
+  executableDir?: string;
   env?: Record<string, string>;
   user?: string;
   group?: string;
@@ -103,11 +109,21 @@ class Unit {
     if (this.def.user) {
       wrap.push("setpriv", `--reuid=${this.def.user}`, `--regid=${this.def.group ?? this.def.user}`, "--init-groups");
     }
+    const dir = this.def.executableDir;
+    const args = argv(cmd);
+    const env = { ...BASE_ENV, ...this.def.env };
+    if (dir) {
+      // "./server" or "bin/server" resolve against executableDir; bare names are found via PATH.
+      if (typeof cmd !== "string" && args[0].includes("/") && !args[0].startsWith("/")) {
+        args[0] = resolve(dir, args[0]);
+      }
+      env.PATH = `${dir}:${env.PATH}`;
+    }
     return {
-      cmd: [...wrap, ...argv(cmd)],
+      cmd: [...wrap, ...args],
       opts: {
-        cwd: this.def.cwd ?? "/",
-        env: { ...BASE_ENV, ...this.def.env },
+        cwd: this.def.cwd ?? dir ?? "/",
+        env,
         stdin: "ignore" as const,
         stdout: "pipe" as const,
         stderr: "pipe" as const,
