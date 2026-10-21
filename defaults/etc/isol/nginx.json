@@ -1,0 +1,15 @@
+{
+  "description": "nginx web server",
+  "exec": ["/usr/sbin/nginx", "-g", "daemon off;"],
+  "pre": [
+    ["/bin/mkdir", "-p", "/var/log/nginx", "/var/lib/nginx"],
+    ["/usr/sbin/nginx", "-t", "-q", "-g", "daemon off;"]
+  ],
+  "reload": ["/usr/sbin/nginx", "-t", "-q", "-g", "daemon off;"],
+  "reloadSignal": "SIGHUP",
+  "enabled": true,
+  "restart": "always",
+  "restartSec": 2,
+  "stopSignal": "SIGQUIT",
+  "stopTimeout": 15
+}

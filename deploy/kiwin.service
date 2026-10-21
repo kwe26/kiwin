@@ -1,0 +1,19 @@
+[Unit]
+Description=Kiwin System (bwrap isolation, isol supervisor, SSH layer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+ExecStart=@BUN@ @ROOT@/kiwin.ts daemon
+Restart=always
+RestartSec=3
+# The daemon stops units inside the isolation gracefully on SIGTERM;
+# anything left over afterwards gets SIGKILL.
+KillMode=mixed
+TimeoutStopSec=60
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
