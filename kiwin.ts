@@ -18,6 +18,12 @@ Usage:
   kiwin shell [user]               Interactive shell inside the isolation
   kiwin exec [-u user] -- <cmd>    Run a command inside the isolation
   kiwin isolation-restart          Tear down and relaunch the whole isolation
+  kiwin recovery                   Print a one-time sign-in link for /recovery (it must be running)
+  kiwin recovery enter             Pause the system and open /recovery
+  kiwin setup-code                 The code the panel asks for on first-run setup
+  kiwin get <name>                 Decrypt a secret listed in /www/redir.json (e.g. mysql_password)
+  kiwin secret-key export          Print the key that seals /www/password.txt (keep it with user.img backups)
+  kiwin secret-key import <key>    Install that key on a new server before moving user.img there
 `;
 
 const cfg = loadConfig();
@@ -167,6 +173,32 @@ switch (cmd) {
     if (!rest.length) die("usage: kiwin exec [-u user] -- <command...>");
     const quoted = rest.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`)).join(" ");
     await enter(user, quoted);
+    break;
+  }
+  case "setup-code":
+    console.log((await apiJson("/setup/code")).code);
+    break;
+  case "get": {
+    if (!args[0]) die("usage: kiwin get <name>   (names come from /www/redir.json)");
+    // Through the daemon: user.img (and so /www) is only mounted while it runs.
+    console.log((await apiJson(`/secrets/get/${encodeURIComponent(args[0])}`)).value);
+    break;
+  }
+  case "secret-key": {
+    const { exportKey, importKey } = await import("./src/secrets");
+    if (args[0] === "export") console.log(exportKey(cfg));
+    else if (args[0] === "import" && args[1]) {
+      importKey(cfg, args[1]);
+      console.log("key installed");
+    } else die("usage: kiwin secret-key export | import <base64-key>");
+    break;
+  }
+  case "recovery": {
+    if (args[0] === "enter") await apiJson("/recovery/enter", "POST");
+    else if (args[0]) die(USAGE);
+    const { token, port } = await apiJson("/recovery/link", "POST");
+    console.log(`http://<this server>:${port}/recovery?t=${token}`);
+    console.log("Works once, for 10 minutes. It signs in with full access, so keep it private.");
     break;
   }
   case "isolation-restart":

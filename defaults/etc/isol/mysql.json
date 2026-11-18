@@ -1,0 +1,11 @@
+{
+  "description": "MySQL server (config and data on user.img: /www/db)",
+  "conditionPathExists": "/www/db/my.cnf",
+  "exec": ["/usr/sbin/mysqld", "--defaults-file=/www/db/my.cnf"],
+  "pre": [["/bin/sh", "-c", "mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld && chmod 755 /run/mysqld"]],
+  "enabled": true,
+  "restart": "always",
+  "restartSec": 3,
+  "stopSignal": "SIGTERM",
+  "stopTimeout": 120
+}

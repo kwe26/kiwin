@@ -1,7 +1,7 @@
-import { chownSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { chownSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, isAbsolute } from "node:path";
 import type { Subprocess } from "bun";
-import { INSIDE, ROOT, paths, type KiwinConfig } from "./config";
+import { INSIDE, ROOT, paths, volatileName, type KiwinConfig } from "./config";
 
 export const isRoot = () => process.getuid?.() === 0;
 
@@ -42,9 +42,63 @@ export function apparmorLabel(pid: number): string | null {
   }
 }
 
-const SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+// /www/softwares/bin holds commands kiwi's Software page installs on user.img,
+// so they are on PATH without touching the system image.
+const SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/www/softwares/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-export function bwrapArgs(cfg: KiwinConfig): string[] {
+const DISABLED_STUB = `#!/bin/sh
+echo "\${0##*/}: package management is disabled inside kiwin. The system image is maintained from the host." >&2
+exit 100
+`;
+
+/** Write the script bound over cfg.disabledCommands. */
+export function writeDisabledStub(cfg: KiwinConfig) {
+  const file = paths(cfg).disabledStub;
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, DISABLED_STUB, { mode: 0o755 });
+  if (isRoot()) chownSync(file, 0, 0);
+}
+
+/**
+ * Host path of `inside` in the rootfs, only if it resolves (symlinks included,
+ * which root inside controls) to something inside the rootfs.
+ */
+function inRootfs(cfg: KiwinConfig, inside: string): string | null {
+  try {
+    const root = realpathSync(cfg.rootfs);
+    const real = realpathSync(join(cfg.rootfs, inside));
+    return real.startsWith(root + "/") ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Paths in the rootfs matching cfg.disabledCommands that are regular files. */
+function disabledCommands(cfg: KiwinConfig): string[] {
+  const found = new Set<string>();
+  for (const pattern of cfg.disabledCommands) {
+    const glob = new Bun.Glob(pattern.replace(/^\/+/, ""));
+    let matches: string[] = [];
+    try {
+      matches = [...glob.scanSync({ cwd: cfg.rootfs, onlyFiles: false, followSymlinks: false, dot: true })];
+    } catch {}
+    for (const rel of matches) {
+      const inside = "/" + rel;
+      const host = inRootfs(cfg, inside);
+      try {
+        if (host && lstatSync(join(cfg.rootfs, inside)).isFile()) found.add(inside);
+      } catch {}
+    }
+  }
+  return [...found].sort();
+}
+
+export interface BwrapExtras {
+  /** Host directory from Images.volatileDir(): bound over cfg.images.volatile. */
+  volatileDir?: string | null;
+}
+
+export function bwrapArgs(cfg: KiwinConfig, extras: BwrapExtras = {}): string[] {
   const p = paths(cfg);
   const args = [
     "--die-with-parent",
@@ -61,9 +115,32 @@ export function bwrapArgs(cfg: KiwinConfig): string[] {
     "--tmpfs", "/run",
     "--dir", "/run/lock",
     "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+    // A minbase system image has no time zone database; programs that need
+    // one (PHP aborts without it, date, Go and Node apps) get the host's.
+    // (Checked by content: after the first start the mountpoint exists, empty.)
+    ...(existsSync("/usr/share/zoneinfo/UTC") && !existsSync(join(cfg.rootfs, "usr/share/zoneinfo/UTC"))
+      ? ["--ro-bind", "/usr/share/zoneinfo", "/usr/share/zoneinfo"]
+      : []),
     "--ro-bind", p.agentSrc, INSIDE.agentDir,
     "--bind", p.ctlDir, INSIDE.ctlDir,
+    "--ro-bind", p.hostDir, INSIDE.hostDir,
   ];
+  // Logs, caches and temp files live on log.img, not the system image.
+  if (extras.volatileDir) {
+    for (const inside of cfg.images.volatile) {
+      const src = join(extras.volatileDir, volatileName(inside));
+      try {
+        if (lstatSync(src).isDirectory()) args.push("--bind", src, inside);
+      } catch {}
+    }
+  }
+  // No package management inside: package databases are read-only and the
+  // tools are replaced by a stub. Root inside has no CAP_SYS_ADMIN to undo it.
+  for (const inside of cfg.readOnlyPaths) {
+    const host = inRootfs(cfg, inside);
+    if (host && statSync(host).isDirectory()) args.push("--ro-bind", host, inside);
+  }
+  for (const inside of disabledCommands(cfg)) args.push("--ro-bind", p.disabledStub, inside);
   if (!isRoot()) {
     // Developer mode: unprivileged user namespace with a fake root.
     args.unshift("--unshare-user", "--uid", "0", "--gid", "0");
@@ -73,9 +150,10 @@ export function bwrapArgs(cfg: KiwinConfig): string[] {
   for (const t of cfg.tmpfs) args.push("--tmpfs", t);
   for (const b of cfg.binds) {
     args.push(b.ro ? "--ro-bind" : "--bind", b.src, b.dest);
-    // kiwin's own directory stays visible but read-only (root inside must not
-    // rewrite code the host runs as root); the rootfs and state (ssh host key,
-    // control sockets) are hidden entirely.
+    // kiwin's own directory (including images/, for KiwiImg.exists()) stays
+    // visible but read-only: root inside must not rewrite code the host runs
+    // as root, or plant images the host mounts. The rootfs and state (ssh host
+    // key, control sockets) are hidden entirely.
     const inside = (p: string) => {
       const rel = relative(b.src, p);
       return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? join(b.dest, rel) : null;
@@ -84,7 +162,7 @@ export function bwrapArgs(cfg: KiwinConfig): string[] {
     if (kiwin) args.push("--ro-bind", ROOT, kiwin);
     for (const hidden of [cfg.rootfs, cfg.stateDir]) {
       const at = inside(hidden);
-      if (at) args.push("--tmpfs", at);
+      if (at && existsSync(hidden)) args.push("--tmpfs", at);
     }
   }
   args.push(
@@ -93,6 +171,7 @@ export function bwrapArgs(cfg: KiwinConfig): string[] {
     "--setenv", "HOME", "/root",
     "--setenv", "LANG", "C.UTF-8",
     "--setenv", "KIWIN_SOCKET", INSIDE.agentSock,
+    "--setenv", "KIWIN_HOST_SOCKET", INSIDE.hostSock,
     "--setenv", "KIWIN_UNITS_DIR", cfg.agent.unitsDir,
     "--setenv", "KIWIN_LOG_DIR", cfg.agent.logDir,
     "--chdir", "/",
@@ -123,7 +202,7 @@ export class Sandbox {
   private stopping = false;
   private onLog: (line: string) => void;
 
-  constructor(private cfg: KiwinConfig, onLog: (line: string) => void) {
+  constructor(private cfg: KiwinConfig, onLog: (line: string) => void, public extras: BwrapExtras = {}) {
     this.onLog = onLog;
   }
 
@@ -133,7 +212,8 @@ export class Sandbox {
 
   async start() {
     this.stopping = false;
-    const args = bwrapArgs(this.cfg);
+    writeDisabledStub(this.cfg);
+    const args = bwrapArgs(this.cfg, this.extras);
     const bwrap = resolveBwrap(this.onLog);
     this.onLog(`launching isolation: ${bwrap} ${args.join(" ")}`);
     const proc = Bun.spawn([bwrap, ...args], {

@@ -150,3 +150,7 @@ vite.config.ts.timestamp-*
 # kiwin runtime state (sockets, ssh host key)
 state/
 system/
+
+# compiled system/user images
+images/
+.update/

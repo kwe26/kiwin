@@ -1,2 +1,3 @@
+#!/bin/sh
 # Kiwin Execution Platform
-sudo /usr/bin/bun kiwin.ts $1 $2
+exec sudo /usr/bin/bun "$(dirname "$(readlink -f "$0")")/kiwin.ts" "$@"

@@ -1,19 +1,24 @@
 // isol agent: runs *inside* the isolation (as its first process) and acts as
-// a tiny systemd. Units are JSON files in $KIWIN_UNITS_DIR (/etc/isol/*.json).
+// a tiny systemd. Units are JSON files in $KIWIN_UNITS_DIR (/etc/isol/*.json),
+// plus user units on user.img in $KIWIN_USER_UNITS_DIR (/www/services/*.json),
+// which can't take over a system unit's name.
 // The host kiwin daemon talks to it over $KIWIN_SOCKET (HTTP over unix socket).
 //
 // This file must stay dependency-free: it runs on the isolation's own bun.
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { Subprocess } from "bun";
 
 const SOCKET = process.env.KIWIN_SOCKET ?? "/run/kiwin/ctl/agent.sock";
 const UNITS_DIR = process.env.KIWIN_UNITS_DIR ?? "/etc/isol";
+const USER_UNITS_DIR = process.env.KIWIN_USER_UNITS_DIR ?? "/www/services";
 const LOG_DIR = process.env.KIWIN_LOG_DIR ?? "/var/log/isol";
 const BASE_ENV: Record<string, string> = {
   PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
   LANG: process.env.LANG ?? "C.UTF-8",
+  // Host API (KiwiImg etc.), see src/daemon.ts hostApi.
+  KIWIN_HOST_SOCKET: process.env.KIWIN_HOST_SOCKET ?? "/run/kiwin/host/host.sock",
 };
 
 type Cmd = string | string[];
@@ -51,6 +56,8 @@ interface UnitDef {
   stopTimeout?: number;
   /** Units that must be running before this one starts. */
   after?: string[];
+  /** Only start when this path exists (like systemd's ConditionPathExists); otherwise stay stopped quietly. */
+  conditionPathExists?: string;
 }
 
 type State = "stopped" | "starting" | "running" | "stopping" | "backoff" | "failed";
@@ -107,7 +114,9 @@ class Unit {
   private spawnArgs(cmd: Cmd) {
     const wrap = ["setsid"];
     if (this.def.user) {
-      wrap.push("setpriv", `--reuid=${this.def.user}`, `--regid=${this.def.group ?? this.def.user}`, "--init-groups");
+      // A numeric user needs no /etc/passwd entry (so the system image stays untouched).
+      const numeric = /^\d+$/.test(this.def.user);
+      wrap.push("setpriv", `--reuid=${this.def.user}`, `--regid=${this.def.group ?? this.def.user}`, numeric ? "--clear-groups" : "--init-groups");
     }
     const dir = this.def.executableDir;
     const args = argv(cmd);
@@ -144,6 +153,13 @@ class Unit {
     if (this.state === "running" || this.state === "starting") return;
     if (this.restartTimer) clearTimeout(this.restartTimer);
     this.restartTimer = null;
+    const cond = this.def.conditionPathExists;
+    if (cond && !existsSync(cond)) {
+      this.wanted = false;
+      this.state = "stopped";
+      this.error = `condition: ${cond} does not exist`;
+      return;
+    }
     this.state = "starting";
     this.error = null;
     try {
@@ -302,16 +318,23 @@ const units = new Map<string, Unit>();
 
 function readDefs(): Map<string, { def: UnitDef; file: string }> {
   const defs = new Map<string, { def: UnitDef; file: string }>();
-  if (!existsSync(UNITS_DIR)) return defs;
-  for (const f of readdirSync(UNITS_DIR).sort()) {
-    if (!f.endsWith(".json")) continue;
-    const file = join(UNITS_DIR, f);
-    try {
-      const def = JSON.parse(readFileSync(file, "utf8")) as UnitDef;
-      if (!def.exec) throw new Error("missing exec");
-      defs.set(basename(f, ".json"), { def, file });
-    } catch (e) {
-      log(`skipping ${file}: ${(e as Error).message}`);
+  for (const dir of [UNITS_DIR, USER_UNITS_DIR]) {
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir).sort()) {
+      if (!f.endsWith(".json")) continue;
+      const file = join(dir, f);
+      const name = basename(f, ".json");
+      if (defs.has(name)) {
+        log(`skipping ${file}: ${name} is already defined by ${defs.get(name)!.file}`);
+        continue;
+      }
+      try {
+        const def = JSON.parse(readFileSync(file, "utf8")) as UnitDef;
+        if (!def.exec) throw new Error("missing exec");
+        defs.set(name, { def, file });
+      } catch (e) {
+        log(`skipping ${file}: ${(e as Error).message}`);
+      }
     }
   }
   return defs;
@@ -498,7 +521,9 @@ async function handle(req: Request): Promise<Response> {
 mkdirSync(LOG_DIR, { recursive: true });
 rmSync(SOCKET, { force: true });
 Bun.serve({ unix: SOCKET, fetch: handle, idleTimeout: 0 });
-log(`isol agent up (pid ${process.pid}), units from ${UNITS_DIR}, socket ${SOCKET}`);
+// Whoever can connect controls every unit: root only, whatever umask we were started with.
+chmodSync(SOCKET, 0o600);
+log(`isol agent up (pid ${process.pid}), units from ${UNITS_DIR} and ${USER_UNITS_DIR}, socket ${SOCKET}`);
 
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, async () => {
