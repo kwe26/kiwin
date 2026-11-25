@@ -1,7 +1,7 @@
 import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { configPath, loadConfig, paths } from "./config";
-import { Sandbox, agentFetch, isRoot } from "./sandbox";
+import { Sandbox, agentFetch, apparmorEnabled, isRoot } from "./sandbox";
 import { startSsh } from "./ssh";
 import { Images } from "./images";
 import { getSecret, seal, unseal } from "./secrets";
@@ -314,7 +314,7 @@ export async function runDaemon() {
             log: images.volatileDir() !== null,
           },
           ssh: cfg.ssh.enabled ? { port: cfg.ssh.port } : null,
-          bwrap: isRoot() ? "private copy (AppArmor-free)" : "system (rootless)",
+          bwrap: !isRoot() ? "system (rootless)" : apparmorEnabled() ? "private copy (AppArmor-free)" : "system (no AppArmor)",
         });
       }
       if (url.pathname === "/images/user" && req.method === "GET") return Response.json(images.userInfo());

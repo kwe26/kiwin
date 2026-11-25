@@ -1,7 +1,10 @@
 /**
- * A WebSocket-shaped channel for noVNC over kiwi's desktop bridge: bytes from
+ * A WebSocket-shaped channel for noVNC over one of kiwi's bridges: bytes from
  * the VNC server arrive as server-sent events, bytes to it are POSTed in small
  * batches, in order. noVNC attaches to anything with these members.
+ *
+ * `base` is the bridge's API path: /api/desktop for the X.org desktop,
+ * /api/vms/<name>/console for a virtual machine.
  */
 export class BridgeChannel {
     binaryType = "arraybuffer";
@@ -16,8 +19,8 @@ export class BridgeChannel {
     private timer: ReturnType<typeof setTimeout> | undefined;
     private chain = Promise.resolve();
 
-    constructor(private id: string) {
-        this.es = new EventSource(`/api/desktop/${id}`);
+    constructor(private id: string, private base = "/api/desktop") {
+        this.es = new EventSource(`${base}/${id}`);
         this.es.onopen = () => {
             if (this.readyState !== "connecting") return;
             this.readyState = "open";
@@ -29,7 +32,7 @@ export class BridgeChannel {
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             this.onmessage?.({ data: bytes.buffer });
         };
-        this.es.addEventListener("close", (e) => this.shut((e as MessageEvent).data || "The desktop closed the connection"));
+        this.es.addEventListener("close", (e) => this.shut((e as MessageEvent).data || "The connection was closed"));
         // Never let EventSource reconnect on its own: a VNC stream can't resume.
         this.es.onerror = () => this.shut("Connection lost");
     }
@@ -53,9 +56,9 @@ export class BridgeChannel {
         }
         this.queue = [];
         this.chain = this.chain.then(() =>
-            fetch(`/api/desktop/${this.id}`, { method: "POST", body, headers: { "content-type": "application/octet-stream" } })
+            fetch(`${this.base}/${this.id}`, { method: "POST", body, headers: { "content-type": "application/octet-stream" } })
                 .then((r) => {
-                    if (r.status === 410) this.shut("The desktop closed the connection");
+                    if (r.status === 410) this.shut("The connection was closed");
                 })
                 .catch(() => {}),
         );
@@ -64,7 +67,7 @@ export class BridgeChannel {
     close() {
         if (this.readyState === "closed") return;
         this.readyState = "closing";
-        fetch(`/api/desktop/${this.id}`, { method: "DELETE" }).catch(() => {});
+        fetch(`${this.base}/${this.id}`, { method: "DELETE" }).catch(() => {});
         this.shut("Disconnected");
     }
 

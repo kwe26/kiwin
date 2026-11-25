@@ -1,4 +1,4 @@
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import type { ServerWebSocket, Subprocess } from "bun";
 
@@ -8,6 +8,11 @@ import type { ServerWebSocket, Subprocess } from "bun";
 const MAX_SHELLS = 6;
 const BACKLOG_BYTES = 256 * 1024;
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.floor(n) || lo));
+
+// bash is at /bin/bash on FHS distros but only in the store on NixOS, where
+// /bin holds nothing but sh. Take whatever this host has.
+const hostShell = () =>
+  Bun.which("bash") ?? ["/bin/bash", "/run/current-system/sw/bin/bash"].find((p) => existsSync(p)) ?? "/bin/sh";
 
 export interface ShellSocket {
   shell: string;
@@ -48,11 +53,12 @@ export class HostShells {
       id: randomBytes(12).toString("hex"), title: `Shell ${++this.seq}`, createdAt: Date.now(),
       proc: null as unknown as Subprocess, backlog: [], bytes: 0, sockets: new Set(), exitCode: null,
     };
-    shell.proc = Bun.spawn(["/bin/bash", "-l"], {
+    const sh = hostShell();
+    shell.proc = Bun.spawn([sh, "-l"], {
       cwd: home,
       env: {
         PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        HOME: "/root", USER: "root", LOGNAME: "root", SHELL: "/bin/bash",
+        HOME: "/root", USER: "root", LOGNAME: "root", SHELL: sh,
         TERM: "xterm-256color", COLORTERM: "truecolor", LANG: process.env.LANG ?? "C.UTF-8",
       },
       terminal: {

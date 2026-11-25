@@ -84,7 +84,7 @@ for t in zstd tar curl e2fsck resize2fs losetup mount chroot sha256sum; do
   command -v "$t" >/dev/null || die "missing $t"
 done
 BUN=$LIB/bun
-[ -x "$BUN" ] || BUN=$(command -v bun) || die "bun is missing"
+[ -x "$BUN" ] || BUN=$(command -v bun 2>/dev/null) || die "bun is missing"
 
 say "Checking the release files"
 (cd "$HERE" && sha256sum -c --quiet SHA256SUMS) || die "checksums don't match: the download is damaged"
@@ -139,7 +139,12 @@ done
 PHASE=swapped
 zstd -dc "$HERE/kiwin.tar.zst" | tar -C "$DEST" --no-same-owner -xf -
 [ -f "$DEST/kiwin.json" ] || cp "$DEST/kiwin.json.default" "$DEST/kiwin.json"
-if [ -x "$(command -v bun)" ]; then install -m 0755 "$(readlink -f "$(command -v bun)")" "$LIB/bun"; fi
+# Refresh the root-owned bun copy. On NixOS bun is a read-only /nix/store path
+# declared in configuration.nix and $LIB may not exist: not having a copy is
+# fine there, so a failure here must not abort the upgrade.
+if [ -d "$LIB" ] && [ -x "$(command -v bun)" ]; then
+  install -m 0755 "$(readlink -f "$(command -v bun)")" "$LIB/bun" || echo "could not refresh $LIB/bun; keeping the old one" >&2
+fi
 
 # ---- System image -------------------------------------------------------------------
 if [ $NEW_IMAGE = 1 ]; then
@@ -206,6 +211,8 @@ if [ $NEW_IMAGE = 1 ]; then
 fi
 
 # ---- Service --------------------------------------------------------------------------
+# On NixOS the unit comes from configuration.nix and /etc/systemd/system is a
+# read-only store symlink, so this step is skipped and the declared unit stands.
 if [ -w /etc/systemd/system ] && [ -f "$DEST/deploy/kiwin.service" ] && [ -x "$LIB/bun" ]; then
   sed -e "s#@ROOT@#$DEST#g" -e "s#@BUN@#$LIB/bun#g" "$DEST/deploy/kiwin.service" > /etc/systemd/system/kiwin.service
   systemctl daemon-reload

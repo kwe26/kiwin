@@ -48,14 +48,24 @@ NixOS manages packages and services declaratively. Add this to
 /etc/nixos/configuration.nix, run `sudo nixos-rebuild switch`, then run
 Setup.sh again (it will install the files and skip this step):
 
-  environment.systemPackages = with pkgs; [ bun bubblewrap zstd e2fsprogs util-linux nftables ];
   networking.firewall.allowedTCPPorts = [ 8888 2222 80 443 ];
+
+  environment.systemPackages = with pkgs; [
+    bun bubblewrap zstd e2fsprogs util-linux nftables
+    # `kiwin` on PATH (/usr/local/bin is not on PATH on NixOS):
+    (writeShellScriptBin "kiwin" ''exec ${bun}/bin/bun /www/kiwin/kiwin.ts "$@"'')
+  ];
+
   systemd.services.kiwin = {
     description = "Kiwin (bwrap isolation, panel, SSH)";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     wantedBy = [ "multi-user.target" ];
-    path = with pkgs; [ bubblewrap zstd e2fsprogs util-linux nftables coreutils gnutar gzip ];
+    # The daemon shells out to these, so they must be on the service's PATH.
+    path = with pkgs; [
+      bubblewrap zstd e2fsprogs util-linux nftables openssh
+      coreutils gnutar gzip curl
+    ];
     serviceConfig = {
       WorkingDirectory = "/www/kiwin";
       ExecStart = "${pkgs.bun}/bin/bun /www/kiwin/kiwin.ts daemon";
@@ -66,6 +76,8 @@ Setup.sh again (it will install the files and skip this step):
       LimitNOFILE = 65536;
     };
   };
+
+Even without the wrapper the CLI is there: sudo /www/kiwin/kiwin status
 NIX
 }
 
@@ -113,9 +125,13 @@ echo "bun $(bun --version) at $BUN_SRC"
 # ---- Files ------------------------------------------------------------------------------
 UPGRADE=0
 [ -f "$DEST/kiwin.ts" ] && UPGRADE=1
-if [ "$IS_NIXOS" = 0 ] && systemctl is-active --quiet kiwin 2>/dev/null; then
+# The files must not change under a running daemon. On NixOS the unit comes
+# from configuration.nix, but stopping and starting it works the same.
+WAS_RUNNING=0
+if systemctl is-active --quiet kiwin 2>/dev/null; then
   say "Stopping the running Kiwin"
   systemctl stop kiwin
+  WAS_RUNNING=1
 fi
 
 say "Installing Kiwin to $DEST$( [ $UPGRADE = 1 ] && echo ' (upgrade: settings, keys and your data are kept)')"
@@ -136,19 +152,27 @@ sha256sum "$HERE/system.img.zst" | cut -d' ' -f1 > "$DEST/images/system.img.rele
 chown -R root:root "$DEST/src" "$DEST/kiwi" "$DEST/kiwin.ts" "$DEST/images/system.img.zst"
 
 # Root-owned bun for the host daemon (never the one inside the system image,
-# which root inside the isolation could change).
-mkdir -p "$LIB"
-install -m 0755 "$BUN_SRC" "$LIB/bun"
-
-cat > /usr/local/bin/kiwin <<SH
+# which root inside the isolation could change). On NixOS bun already lives in
+# the read-only /nix/store, so it is used from there and nothing is copied.
+if [ "$IS_NIXOS" = 0 ]; then
+  mkdir -p "$LIB"
+  install -m 0755 "$BUN_SRC" "$LIB/bun"
+  mkdir -p /usr/local/bin
+  cat > /usr/local/bin/kiwin <<SH
 #!/bin/sh
 exec $LIB/bun $DEST/kiwin.ts "\$@"
 SH
-chmod 755 /usr/local/bin/kiwin
+  chmod 755 /usr/local/bin/kiwin
+fi
 
 # ---- Service -----------------------------------------------------------------------------
 if [ "$IS_NIXOS" = 1 ]; then
   say "Files are installed."
+  if [ "$WAS_RUNNING" = 1 ]; then
+    systemctl start kiwin && echo "Kiwin restarted on the new version (journalctl -u kiwin -f)."
+    echo "Panel: http://<this server>:$PORT   CLI: sudo kiwin status"
+    exit 0
+  fi
   echo "Declare the service in configuration.nix (if you haven't yet) and run nixos-rebuild switch:"
   nixos_help
   exit 0
@@ -172,6 +196,7 @@ while [ $i -lt 180 ]; do
 done
 
 CODE=$("$LIB/bun" "$DEST/kiwin.ts" setup-code 2>/dev/null || echo "run: sudo kiwin setup-code")
+
 IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
 [ -n "$IP" ] || IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -n "$IP" ] || IP="<this server's IP>"

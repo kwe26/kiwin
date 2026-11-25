@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
-    Activity, ArchiveRestore, ChevronRight, Table2, ArrowDownUp, ArrowUpCircle, Settings, AtSign, BrickWallFire, Inbox, Mail, Settings2, Users, Database, FileCode, Monitor, Puzzle, SlidersHorizontal, Workflow, FolderOpen, Globe, LayoutDashboard, List, Package, Plus, Server, SquareTerminal, UserRound, type LucideIcon,
+    Activity, ArchiveRestore, ChevronRight, Cpu, HardDrive, Table2, ArrowDownUp, ArrowUpCircle, Settings, AtSign, BrickWallFire, Inbox, Mail, Settings2, Users, Database, FileCode, Monitor, Puzzle, SlidersHorizontal, Workflow, FolderOpen, Globe, LayoutDashboard, List, Package, Plus, Server, SquareTerminal, UserRound, type LucideIcon,
 } from "lucide-react";
 
 interface NavItem {
@@ -52,6 +52,14 @@ const ITEMS: NavItem[] = [
     },
     { href: "/pm2", label: "PM2", icon: Workflow },
     { href: "/desktop", label: "Desktop", icon: Monitor },
+    {
+        href: "/vms", label: "Virtual Machines", icon: Cpu,
+        children: [
+            { href: "/vms", label: "Machines", icon: List, exact: true },
+            { href: "/vms/new", label: "Create", icon: Plus, exact: true },
+            { href: "/vms/images", label: "Disk images", icon: HardDrive, exact: true },
+        ],
+    },
     { href: "/services", label: "Services", icon: Server },
     { href: "/tasks", label: "Task Manager", icon: Activity },
     { href: "/firewall", label: "Firewall", icon: BrickWallFire },
@@ -68,13 +76,14 @@ const ITEMS: NavItem[] = [
 ];
 
 /** Sections that only make sense once something is installed. */
-const OPTIONAL: Record<string, keyof NavFeatures> = { "/php": "php", "/pm2": "pm2", "/desktop": "desktop", "/mail": "mail" };
+const OPTIONAL: Record<string, keyof NavFeatures> = { "/php": "php", "/pm2": "pm2", "/desktop": "desktop", "/mail": "mail", "/vms": "vms" };
 
 export interface NavFeatures {
     php: boolean;
     pm2: boolean;
     desktop: boolean;
     mail: boolean;
+    vms: boolean;
     mysqlManager: boolean;
 }
 

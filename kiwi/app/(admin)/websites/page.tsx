@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowUpRight, Globe, Plus, Settings2 } from "lucide-react";
 import { ActionForm, SubmitButton } from "@/components/forms";
-import { HttpsBadge, TypeBadge, siteTarget } from "@/components/site-badges";
+import { HttpsBadge, ProtectionBadge, TypeBadge, siteTarget } from "@/components/site-badges";
 import { KiwiNginx } from "@/lib/nginx";
 import { requireUser } from "@/lib/session";
 import { reloadNginx, testNginx } from "@/app/actions";
@@ -54,6 +54,7 @@ export default async function Websites() {
                                     <th scope="col">Serves</th>
                                     <th scope="col">HTTPS</th>
                                     <th scope="col">Status</th>
+                                    <th scope="col">Protection</th>
                                     <th scope="col"><span className="sr-only">Actions</span></th>
                                 </tr>
                             </thead>
@@ -78,6 +79,7 @@ export default async function Websites() {
                                             <td>
                                                 <span className="status"><span className={site.enabled ? "dot dot-ok" : "dot"} aria-hidden />{site.enabled ? "Enabled" : "Disabled"}</span>
                                             </td>
+                                            <td><ProtectionBadge site={site} /></td>
                                             <td className="cell-actions">
                                                 <a href={url} target="_blank" rel="noreferrer" className="btn btn-ghost" aria-label={`Visit ${site.domain}`}><ArrowUpRight size={16} aria-hidden /> Visit</a>
                                                 <Link href={`/websites/${site.domain}`} className="btn btn-secondary"><Settings2 size={15} aria-hidden /> Manage</Link>

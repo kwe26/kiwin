@@ -63,6 +63,8 @@ export function CreateSiteForm({ phpVersions, email, staging }: { phpVersions: s
                 )}
             </div>
 
+            <p className="hint">New websites start with attack prevention on: one visitor can ask for 15 requests a second, known scanners are refused, and probes for <code>.env</code> or <code>.git</code> never reach the site. Change or switch it off on the website&apos;s page.</p>
+
             <div className="row"><SubmitButton>Create website</SubmitButton></div>
         </ActionForm>
     );

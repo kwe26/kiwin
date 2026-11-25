@@ -8,7 +8,7 @@ import type { ActionState } from "@/components/forms";
 import { KiwiAuth } from "@/lib/auth";
 import { KiwiImg } from "@/lib/img";
 import { KiwiMysql } from "@/lib/mysql";
-import { KiwiNginx, type SiteType } from "@/lib/nginx";
+import { KiwiNginx, PROTECT_LEVELS, type ProtectLevel, type SiteType } from "@/lib/nginx";
 import { KiwiAcme } from "@/lib/acme";
 import { posix } from "node:path";
 import { KiwiFiles, clean } from "@/lib/files";
@@ -203,6 +203,40 @@ export async function setForceHttps(domain: string, on: boolean, _: ActionState,
     if (!(await KiwiNginx.setForceHttps(domain, on))) return fail(KiwiNginx.lastError ?? "Failed");
     revalidatePath("/websites");
     return done(on ? "HTTP now redirects to HTTPS" : "HTTP is served directly again");
+}
+
+/**
+ * Attack prevention for one website. "off" serves it exactly as before; the
+ * other levels cap how much one visitor can ask for at once, which spam and
+ * brute-force traffic runs into long before a person browsing the site does.
+ */
+export async function setSiteProtection(domain: string, _: ActionState, fd: FormData): Promise<ActionState> {
+    await requireUser();
+    const level = text(fd, "level");
+    if (level === "off") {
+        if (!(await KiwiNginx.setProtection(domain, null))) return fail(KiwiNginx.lastError ?? "Failed");
+        revalidatePath("/websites");
+        return done(`Attack prevention is off for ${domain}.`);
+    }
+    if (!(level in PROTECT_LEVELS)) return fail("Choose a protection level");
+    const protect = {
+        level: level as ProtectLevel,
+        blockTools: fd.get("blockTools") === "on",
+        blockProbes: fd.get("blockProbes") === "on",
+        protectLogin: fd.get("protectLogin") === "on",
+    };
+    if (!(await KiwiNginx.setProtection(domain, protect))) return fail(KiwiNginx.lastError ?? "Failed");
+    revalidatePath("/websites");
+    return done(`Attack prevention saved: ${PROTECT_LEVELS[protect.level].label}.`);
+}
+
+/** Addresses that no limit applies to, shared by every website. */
+export async function setTrustedAddresses(_: ActionState, fd: FormData): Promise<ActionState> {
+    await requireUser();
+    const list = text(fd, "trusted").split(/[\s,]+/).filter(Boolean);
+    if (!(await KiwiNginx.setTrusted(list))) return fail(KiwiNginx.lastError ?? "Failed");
+    revalidatePath("/websites");
+    return done(list.length ? `${list.length} address${list.length === 1 ? "" : "es"} are never limited.` : "No address is exempt from the limits now.");
 }
 
 export async function testNginx(_: ActionState, __: FormData): Promise<ActionState> {

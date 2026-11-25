@@ -7,6 +7,7 @@ import { KiwiPhp } from "@/lib/php";
 import { KiwiDesktop } from "@/lib/desktop";
 import { KiwiMail } from "@/lib/mail";
 import { KiwiMysqlAdmin } from "@/lib/mysql-admin";
+import { KiwiVms } from "@/lib/vms";
 import { logout } from "@/app/actions";
 
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
@@ -16,6 +17,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
         pm2: !!(KiwiSoftware.current("nodejs") || KiwiSoftware.current("bun")),
         desktop: KiwiDesktop.isInstalled(),
         mail: KiwiMail.isInstalled(),
+        vms: KiwiVms.isInstalled(),
         mysqlManager: KiwiMysqlAdmin.enabled(),
     };
     return (

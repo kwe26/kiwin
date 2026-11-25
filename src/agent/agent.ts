@@ -183,9 +183,26 @@ class Unit {
       proc.exited.then((code) => this.onExit(proc, code));
     } catch (e) {
       this.state = "failed";
-      this.error = String((e as Error).message ?? e);
+      this.error = this.spawnError(e);
       this.write("isol", `start failed: ${this.error}`);
     }
+  }
+
+  /**
+   * posix_spawn reports a missing cwd as ENOENT against argv[0] ("setsid"),
+   * which says nothing about the real cause. Name the path that is missing.
+   */
+  private spawnError(e: unknown): string {
+    const msg = String((e as Error)?.message ?? e);
+    const { opts } = this.spawnArgs(this.def.exec);
+    if (/ENOENT/.test(msg)) {
+      if (!existsSync(opts.cwd)) {
+        return `${opts.cwd} does not exist inside the isolation (unit cwd/executableDir; a bind in kiwin.json may be missing, or point at a symlink that dangles in here)`;
+      }
+      const exe = argv(this.def.exec)[0];
+      if (exe.includes("/") && !existsSync(exe)) return `${exe} does not exist inside the isolation`;
+    }
+    return msg;
   }
 
   private async onExit(proc: Subprocess, code: number) {

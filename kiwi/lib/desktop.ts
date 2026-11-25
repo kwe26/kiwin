@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Socket } from "bun";
 import { agent } from "./host";
+import { SocketBridges } from "./socket-bridge";
 
 // "X.org Interface": an Xvnc desktop (TigerVNC + Openbox + tint2 + xterm)
 // installed from Software onto user.img, shown in the panel with noVNC.
@@ -13,10 +13,8 @@ import { agent } from "./host";
 //   /www/services/desktop.json         its isol unit
 //   /run/kiwi-desktop/vnc.sock         Xvnc's VNC socket (root only, no TCP port)
 //
-// The browser never talks VNC to the network: noVNC's bytes travel over an
-// event stream (server -> browser) and POSTs (browser -> server) to the
-// bridge below, which holds the unix socket connection. Same transport as the
-// web terminal, so it works through any proxy that can do the panel.
+// The browser reaches it through a SocketBridges bridge (see lib/socket-bridge.ts),
+// the same transport the Virtual Machines console uses.
 
 const ROOT = "/www/softwares/xorg/current/root";
 const SESSION = "/www/softwares/xorg/session.sh";
@@ -32,7 +30,6 @@ const DISPLAY = ":77";
 /** The session's X cookie: without it any local user (a website's PHP) could type into root's desktop. */
 const XAUTHORITY = "/run/kiwi-desktop/Xauthority";
 const MAX_BRIDGES = 4;
-const IDLE_MS = 30_000;
 
 const SESSION_SCRIPT = `#!/bin/sh
 # Written by kiwi: the X.org Interface session, viewed from the panel's Desktop page.
@@ -170,26 +167,7 @@ clock_font_color = #f5ecec 100
 clock_padding = 6 0
 `;
 
-interface Bridge {
-    id: string;
-    socket: Socket<undefined> | null;
-    /** Server bytes waiting for the browser's event stream to attach. */
-    pending: Uint8Array[];
-    listener: ((chunk: Uint8Array | null) => void) | null;
-    /** Browser bytes the socket couldn't take yet. */
-    outbox: Uint8Array[];
-    lastSeen: number;
-    closed: boolean;
-}
-
-const bridges = ((globalThis as any).__kiwiDesktopBridges ??= new Map<string, Bridge>()) as Map<string, Bridge>;
-
-function sweep() {
-    const now = Date.now();
-    for (const b of bridges.values()) if (b.closed || (!b.listener && now - b.lastSeen > IDLE_MS)) KiwiDesktop.disconnect(b.id);
-}
-(globalThis as any).__kiwiDesktopSweeper ??= setInterval(sweep, 10_000);
-((globalThis as any).__kiwiDesktopSweeper as { unref?: () => void }).unref?.();
+const bridges = new SocketBridges("desktop", MAX_BRIDGES);
 
 export class KiwiDesktop {
     static isInstalled(): boolean {
@@ -283,93 +261,34 @@ export class KiwiDesktop {
     }
 
     static async stop(): Promise<void> {
-        for (const id of [...bridges.keys()]) this.disconnect(id);
+        bridges.closeAll();
         await agent(`/units/${UNIT}/stop`, {});
     }
 
     // ---- Bridge between the browser and the VNC socket ----
 
     static async connect(apps: DesktopApp[] = []): Promise<string> {
-        sweep();
-        if (bridges.size >= MAX_BRIDGES) throw new Error(`Too many desktop connections (max ${MAX_BRIDGES})`);
         if (!existsSync(SOCKET)) await this.start(apps);
-        const id = randomBytes(16).toString("hex");
-        const bridge: Bridge = { id, socket: null, pending: [], listener: null, outbox: [], lastSeen: Date.now(), closed: false };
-        bridges.set(id, bridge);
         try {
-            bridge.socket = await Bun.connect({
-                unix: SOCKET,
-                socket: {
-                    data(_s, data) {
-                        const chunk = new Uint8Array(data);
-                        if (bridge.listener) bridge.listener(chunk);
-                        else bridge.pending.push(chunk);
-                    },
-                    drain(s) {
-                        while (bridge.outbox.length) {
-                            const next = bridge.outbox[0];
-                            const n = s.write(next);
-                            if (n < next.length) {
-                                bridge.outbox[0] = next.subarray(n);
-                                return;
-                            }
-                            bridge.outbox.shift();
-                        }
-                    },
-                    close() {
-                        KiwiDesktop.disconnect(id);
-                    },
-                    error() {
-                        KiwiDesktop.disconnect(id);
-                    },
-                },
-            });
+            return await bridges.connect(SOCKET, `Too many desktop connections (max ${MAX_BRIDGES})`);
         } catch (e) {
-            bridges.delete(id);
             throw new Error(`Could not connect to the desktop: ${(e as Error).message}`);
         }
-        return id;
     }
 
     static exists(id: string): boolean {
-        return bridges.has(id);
+        return bridges.exists(id);
     }
 
-    /** One viewer per connection (VNC is stateful): replays what arrived before it attached. */
     static attach(id: string, listener: (chunk: Uint8Array | null) => void): () => void {
-        const b = bridges.get(id);
-        if (!b) throw new Error("No such desktop connection");
-        if (b.listener) throw new Error("Already attached");
-        for (const c of b.pending) listener(c);
-        b.pending = [];
-        b.listener = listener;
-        b.lastSeen = Date.now();
-        return () => {
-            // The event stream closing ends the VNC connection; noVNC reconnects with a new one.
-            KiwiDesktop.disconnect(id);
-        };
+        return bridges.attach(id, listener);
     }
 
     static write(id: string, data: Uint8Array) {
-        const b = bridges.get(id);
-        if (!b || !b.socket || b.closed) throw new Error("Desktop connection closed");
-        b.lastSeen = Date.now();
-        if (b.outbox.length) {
-            b.outbox.push(data);
-            return;
-        }
-        const n = b.socket.write(data);
-        if (n < data.length) b.outbox.push(data.subarray(n));
+        bridges.write(id, data);
     }
 
     static disconnect(id: string) {
-        const b = bridges.get(id);
-        if (!b) return;
-        bridges.delete(id);
-        b.closed = true;
-        try {
-            b.socket?.end();
-        } catch {}
-        b.listener?.(null);
+        bridges.disconnect(id);
     }
 }

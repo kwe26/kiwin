@@ -10,8 +10,12 @@ interface ImageMount {
   options: string;
 }
 
-const run = (cmd: string[]) => {
-  const p = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+const run = (cmd: string[], env?: Record<string, string>) => {
+  const p = Bun.spawnSync(cmd, {
+    env: env ? { ...process.env, ...env } : undefined,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   return { code: p.exitCode, out: p.stdout.toString().trim(), err: p.stderr.toString().trim() };
 };
 
@@ -446,7 +450,17 @@ export class Images {
       throw new Error(`refusing to mount on ${m.target}: not a plain directory`);
     }
     try {
-      const r = run(["mount", "--no-canonicalize", "-o", m.options, image, `/proc/${process.pid}/fd/${fd}`]);
+      // util-linux 2.42 (NixOS 26.05) mounts through the new fsopen/move_mount
+      // API, which cannot take a /proc/<pid>/fd/<n> target while
+      // --no-canonicalize keeps libmount from resolving that magic link: it
+      // fails as "wrong fs type, bad option, bad superblock". The classic
+      // mount(2) syscall resolves it in the kernel, so ask for that one and
+      // keep the fd pinned; older libmount takes that path anyway and ignores
+      // the variable.
+      const r = run(
+        ["mount", "--no-canonicalize", "-o", m.options, image, `/proc/${process.pid}/fd/${fd}`],
+        { LIBMOUNT_FORCE_MOUNT2: "always" },
+      );
       if (r.code !== 0) throw new Error(`mount ${image} on ${m.target} failed: ${r.err}`);
     } finally {
       closeSync(fd);

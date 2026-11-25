@@ -1,5 +1,5 @@
-import { FileCode, FileText, Lock, LockOpen, Network } from "lucide-react";
-import type { Site } from "@/lib/nginx";
+import { FileCode, FileText, Lock, LockOpen, Network, Shield, ShieldOff } from "lucide-react";
+import { PROTECT_LEVELS, type Site } from "@/lib/nginx";
 
 export function TypeBadge({ site }: { site: Site }) {
     if (site.type === "proxy") return <span className="badge"><Network size={13} aria-hidden /> Proxy</span>;
@@ -17,6 +17,13 @@ export function HttpsBadge({ site, secured }: { site: Site; secured: boolean }) 
             <Lock size={13} aria-hidden /> {site.ssl.staging ? "Staging · " : ""}{when}
         </span>
     );
+}
+
+export function ProtectionBadge({ site }: { site: Site }) {
+    if (!site.protect) return <span className="badge" title="Nothing limits how much one visitor can ask for."><ShieldOff size={13} aria-hidden /> Unprotected</span>;
+    const level = PROTECT_LEVELS[site.protect.level];
+    const name = site.protect.level[0].toUpperCase() + site.protect.level.slice(1);
+    return <span className="badge badge-ok" title={`${level.label}, ${level.conn} connections at a time`}><Shield size={13} aria-hidden /> {name}</span>;
 }
 
 export function siteTarget(site: Site): string {

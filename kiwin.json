@@ -3,7 +3,7 @@
   "hostname": "kiwin",
   "stateDir": "./state",
   "binds": [
-    { "src": "/www", "dest": "/mount/www" }
+    { "src": "..", "dest": "/mount/www" }
   ],
   "ssh": {
     "enabled": true,

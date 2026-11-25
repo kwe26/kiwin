@@ -1,3 +1,30 @@
 #!/bin/sh
 # Kiwin Execution Platform
-exec sudo /usr/bin/bun "$(dirname "$(readlink -f "$0")")/kiwin.ts" "$@"
+
+# Set up PATH first: this script needs dirname/readlink, and the CLI shells out
+# to nsenter, bwrap, nft and friends. /run/current-system/sw/bin is NixOS.
+PATH=$PATH:/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+DIR=$(dirname "$(readlink -f "$0")")
+
+# Bun sits in a different place on every distro (/usr/bin on Debian/Ubuntu, the
+# /nix/store on NixOS), so look it up instead of hardcoding it. The installer's
+# root-owned copy wins: the one in system/ can be changed by root inside the
+# isolation, so the host must never run it.
+BUN=${KIWIN_BUN:-}
+if [ -z "$BUN" ]; then
+  FOUND=$(command -v bun 2>/dev/null || true)
+  for c in /usr/local/lib/kiwin/bun "$FOUND" /usr/bin/bun /run/current-system/sw/bin/bun; do
+    if [ -n "$c" ] && [ -x "$c" ]; then BUN=$c; break; fi
+  done
+fi
+if [ -z "$BUN" ]; then
+  echo "kiwin: bun not found. Install it (NixOS: environment.systemPackages = [ pkgs.bun ])," >&2
+  echo "       or point KIWIN_BUN at it." >&2
+  exit 1
+fi
+
+[ "$(id -u)" = 0 ] && exec "$BUN" "$DIR/kiwin.ts" "$@"
+# sudo wipes PATH when it is built with secure_path, so hand ours over.
+exec sudo PATH="$PATH" "$BUN" "$DIR/kiwin.ts" "$@"

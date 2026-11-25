@@ -1,7 +1,7 @@
 import { chownSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, isAbsolute } from "node:path";
 import type { Subprocess } from "bun";
-import { INSIDE, ROOT, paths, volatileName, type KiwinConfig } from "./config";
+import { INSIDE, ROOT, paths, volatileName, type BindMount, type KiwinConfig } from "./config";
 
 export const isRoot = () => process.getuid?.() === 0;
 
@@ -11,26 +11,54 @@ export const isRoot = () => process.getuid?.() === 0;
  * even when bwrap runs as root. Root inside then can't bind :80, setuid, or
  * override file permissions. The profile matches by path, so as root we run a
  * root-owned private copy instead (capabilities are still trimmed via --cap-drop).
+ * Where AppArmor isn't in play (NixOS, Fedora) the system binary is used as is;
+ * on NixOS it is a /nix/store path that must not be copied anyway.
  */
 export const PRIVATE_BWRAP = "/usr/local/lib/kiwin/bwrap";
 
-export function resolveBwrap(log: (l: string) => void): string {
+/** Is AppArmor loaded? Only then can a path-based profile confine bwrap. */
+export const apparmorEnabled = () => existsSync("/sys/kernel/security/apparmor");
+
+export function resolveBwrap(cfg: KiwinConfig, log: (l: string) => void): string {
   if (!isRoot()) return "bwrap";
   const system = Bun.which("bwrap");
   if (!system) throw new Error("bwrap not found in PATH");
+  if (!apparmorEnabled()) return system;
+  // /usr is read-only or absent on some systems (NixOS): keep the copy in state/.
+  const dest = writableDir(dirname(PRIVATE_BWRAP)) ? PRIVATE_BWRAP : join(cfg.stateDir, "bwrap");
   const src = readFileSync(system);
   let current: Buffer | null = null;
   try {
-    current = readFileSync(PRIVATE_BWRAP);
+    current = readFileSync(dest);
   } catch {}
   if (!current || !current.equals(src)) {
-    mkdirSync(dirname(PRIVATE_BWRAP), { recursive: true, mode: 0o755 });
-    writeFileSync(PRIVATE_BWRAP + ".tmp", src, { mode: 0o755 });
-    chownSync(PRIVATE_BWRAP + ".tmp", 0, 0);
-    renameSync(PRIVATE_BWRAP + ".tmp", PRIVATE_BWRAP);
-    log(`installed private bwrap copy at ${PRIVATE_BWRAP} (from ${system})`);
+    mkdirSync(dirname(dest), { recursive: true, mode: 0o755 });
+    writeFileSync(dest + ".tmp", src, { mode: 0o755 });
+    chownSync(dest + ".tmp", 0, 0);
+    renameSync(dest + ".tmp", dest);
+    log(`installed private bwrap copy at ${dest} (from ${system})`);
   }
-  return PRIVATE_BWRAP;
+  return dest;
+}
+
+function writableDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o755 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Host time zone database, bound in when the system image has none: FHS
+ * distros keep it in /usr/share/zoneinfo, NixOS in /etc/zoneinfo.
+ */
+export function hostZoneinfo(): string | null {
+  for (const dir of ["/usr/share/zoneinfo", "/etc/zoneinfo", "/run/current-system/sw/share/zoneinfo"]) {
+    if (existsSync(join(dir, "UTC"))) return dir;
+  }
+  return null;
 }
 
 /** AppArmor label of a process, e.g. "unconfined" or "bwrap//&unpriv_bwrap (enforce)". */
@@ -93,6 +121,18 @@ function disabledCommands(cfg: KiwinConfig): string[] {
   return [...found].sort();
 }
 
+/**
+ * Where `p` (a host path) shows up inside the isolation through bind `b`, or
+ * null when the bind does not contain it. Plain path arithmetic: a symlink
+ * under b.src pointing outside it is *not* followed, because inside the
+ * isolation it would resolve against the system image, where its target does
+ * not exist (and bwrap cannot mount over a symlink).
+ */
+export function pathInside(b: BindMount, p: string): string | null {
+  const rel = relative(b.src, p);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? join(b.dest, rel) : null;
+}
+
 export interface BwrapExtras {
   /** Host directory from Images.volatileDir(): bound over cfg.images.volatile. */
   volatileDir?: string | null;
@@ -111,6 +151,10 @@ export function bwrapArgs(cfg: KiwinConfig, extras: BwrapExtras = {}): string[] 
     "--hostname", cfg.hostname,
     "--bind", cfg.rootfs, "/",
     "--dev", "/dev",
+    // bwrap's /dev carries only the standard devices, so KVM would be invisible
+    // inside. Bound when the host has it: the Virtual Machines page runs QEMU
+    // in here and falls back to TCG emulation when it is missing.
+    "--dev-bind-try", "/dev/kvm", "/dev/kvm",
     "--proc", "/proc",
     "--tmpfs", "/run",
     "--dir", "/run/lock",
@@ -118,8 +162,8 @@ export function bwrapArgs(cfg: KiwinConfig, extras: BwrapExtras = {}): string[] 
     // A minbase system image has no time zone database; programs that need
     // one (PHP aborts without it, date, Go and Node apps) get the host's.
     // (Checked by content: after the first start the mountpoint exists, empty.)
-    ...(existsSync("/usr/share/zoneinfo/UTC") && !existsSync(join(cfg.rootfs, "usr/share/zoneinfo/UTC"))
-      ? ["--ro-bind", "/usr/share/zoneinfo", "/usr/share/zoneinfo"]
+    ...(!existsSync(join(cfg.rootfs, "usr/share/zoneinfo/UTC")) && hostZoneinfo()
+      ? ["--ro-bind", hostZoneinfo()!, "/usr/share/zoneinfo"]
       : []),
     "--ro-bind", p.agentSrc, INSIDE.agentDir,
     "--bind", p.ctlDir, INSIDE.ctlDir,
@@ -154,10 +198,7 @@ export function bwrapArgs(cfg: KiwinConfig, extras: BwrapExtras = {}): string[] 
     // visible but read-only: root inside must not rewrite code the host runs
     // as root, or plant images the host mounts. The rootfs and state (ssh host
     // key, control sockets) are hidden entirely.
-    const inside = (p: string) => {
-      const rel = relative(b.src, p);
-      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? join(b.dest, rel) : null;
-    };
+    const inside = (p: string) => pathInside(b, p);
     const kiwin = inside(ROOT);
     if (kiwin) args.push("--ro-bind", ROOT, kiwin);
     for (const hidden of [cfg.rootfs, cfg.stateDir]) {
@@ -213,8 +254,19 @@ export class Sandbox {
   async start() {
     this.stopping = false;
     writeDisabledStub(this.cfg);
+    // The panel unit runs from /mount/www/kiwin/kiwi, so a bind has to carry
+    // this directory inside. It doesn't when kiwin lives outside the bound
+    // tree, or is reached through a symlink (/www/kiwin -> another disk): the
+    // symlink dangles in there and units fail with a bare spawn ENOENT.
+    if (!this.cfg.binds.some((b) => pathInside(b, ROOT))) {
+      this.onLog(
+        `warning: ${ROOT} is not inside any bind in kiwin.json, so it is not visible in the isolation ` +
+          `and units that run from it (the panel) cannot start. Bind the directory holding kiwin ` +
+          `("src": ".."), not a path that only reaches it through a symlink.`,
+      );
+    }
     const args = bwrapArgs(this.cfg, this.extras);
-    const bwrap = resolveBwrap(this.onLog);
+    const bwrap = resolveBwrap(this.cfg, this.onLog);
     this.onLog(`launching isolation: ${bwrap} ${args.join(" ")}`);
     const proc = Bun.spawn([bwrap, ...args], {
       stdin: "ignore",

@@ -40,7 +40,7 @@ const VERSION = /^[0-9A-Za-z][0-9A-Za-z.+~_-]{0,63}$/;
 const FILE_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,63}$/;
 const TAR = /\.(tar\.xz|tar\.gz|tgz|tar\.bz2|tar\.zst)$/;
 /** Bumped when DEFAULT_REPO gains software, so existing repo.json files pick it up once. */
-const REPO_VERSION = 10;
+const REPO_VERSION = 11;
 /** Fields of a default entry that a repo.json upgrade refreshes (the name, icon and homepage stay as edited). */
 const MANAGED_KEYS = [
     "summary", "description", "developer", "format", "bin", "binary", "links", "strip", "releases", "service", "deb",
@@ -466,6 +466,37 @@ const DEFAULT_REPO: { version: number; software: Software[] } = {
                 patches: [{ file: "usr/bin/Xtigervnc", from: "/usr/bin", to: "/run/kx" }],
             },
             versions: [{ version: "1.13.1+dfsg-2build2", url: "deb:tigervnc-standalone-server", channel: "Ubuntu" }],
+        },
+        {
+            id: "qemu",
+            name: "QEMU",
+            summary: "Run virtual machines, with KVM acceleration and a console in the panel",
+            description:
+                "QEMU runs full virtual machines on this server: their own kernel, their own disks, their own network. Installing it adds a Virtual Machines page to the panel, where you create machines, manage their disk images and snapshots, and use their screen right here in the browser.\n\n" +
+                "Machines are hardware-accelerated with KVM when this server offers it (a bare-metal server, or a VPS with nested virtualization), and fall back to full emulation when it doesn't \u2014 correct either way, but much slower. Includes qemu-img for disk images and OVMF for UEFI guests.\n\n" +
+                "A machine's screen never goes on the network: the panel talks to it over a private socket behind your login. Its network is user-mode (no host privileges), so the guest reaches out freely and only the ports you forward reach in.",
+            icon: "https://www.qemu.org/assets/images/qemu_head_200x.png",
+            developer: "The QEMU Project",
+            homepage: "https://www.qemu.org",
+            license: "GPL-2.0",
+            category: "Virtualization",
+            format: "deb",
+            bin: "bin",
+            deb: {
+                // qemu-system-data and seabios (the firmware blobs) come in as dependencies.
+                packages: ["qemu-system-x86", "qemu-utils", "ovmf"],
+                versionOf: "qemu-system-x86",
+                commands: {
+                    // QEMU looks for firmware in a compiled-in /usr/share/qemu; point it at the packages'.
+                    "qemu-system-x86_64": { exec: "usr/bin/qemu-system-x86_64", args: ["-L", "{root}/usr/share/qemu"] },
+                    "qemu-img": { exec: "usr/bin/qemu-img" },
+                    "qemu-io": { exec: "usr/bin/qemu-io" },
+                },
+                // Ubuntu ships SPICE, OpenGL and audio backends as separate modules
+                // (Recommends, so not installed): nothing here loads them.
+                exclude: ["libgl1-mesa-dri", "mesa-libgallium", "libllvm20", "libgbm1", "libvulkan1", "libglx-mesa0"],
+            },
+            versions: [{ version: "1:8.2.2+ds-0ubuntu1", url: "deb:qemu-system-x86", channel: "Ubuntu" }],
         },
         {
             id: "code-server",
@@ -911,7 +942,8 @@ function validCommands(raw: unknown): Software["launchers"] {
 }
 
 /** Ports something is listening on (the isolation shares the host's network). */
-function portsInUse(): Set<number> {
+/** TCP ports with a listening socket right now (/proc/net/tcp state 0A). */
+export function portsInUse(): Set<number> {
     const used = new Set<number>();
     for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
         try {

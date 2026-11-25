@@ -7,6 +7,7 @@ import { KiwiPhp, SITE_UID_MIN, wwwDataUid } from "./php";
 //
 // Everything that belongs to the user lives on user.img (/www):
 //   /www/nginx/sites.json              site definitions (source of truth)
+//   /www/nginx/protect.json            attack prevention settings shared by all sites
 //   /www/nginx/sites/<domain>.conf     generated server blocks (root-only dir)
 //   /www/nginx/certs/<domain>/         Let's Encrypt certificate + key
 //   /www/nginx/logs/                   per-site access/error logs
@@ -25,6 +26,8 @@ const MAX_CONFIG = 256 * 1024;
 const LOG_DIR = join(NGINX_DIR, "logs");
 export const CERT_DIR = join(NGINX_DIR, "certs");
 const META = join(NGINX_DIR, "sites.json");
+/** Attack prevention settings shared by every site (addresses that are never limited). */
+const PROTECT_META = join(NGINX_DIR, "protect.json");
 export const WEB_DIR = "/www/sites";
 export const ACME_WEBROOT = join(WEB_DIR, "_acme");
 /** Name of a site's web root folder (as on cPanel-style hosts). Sites before it used "public". */
@@ -66,15 +69,117 @@ export interface Site {
     phpPaths?: string[];
     /** php: the numeric user its own pool runs as (kept if the site stops being a PHP site). */
     uid?: number;
+    /** Limits on spam traffic and attack tools; absent means the site is served unprotected. */
+    protect?: Protection;
 }
 
-const INCLUDE = `# Managed by kiwi: websites from user storage (/www/nginx/sites).
+/** An address or range that is never rate limited (your office, a monitoring service). */
+const TRUSTED = /^(?:\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?|[0-9a-fA-F:]{2,45}(?:\/\d{1,3})?)$/;
+
+export type ProtectLevel = "lenient" | "standard" | "strict";
+
+/**
+ * How hard each level leans on one visitor. The rate is what a single address
+ * may keep up indefinitely; the burst is how much of a head start it gets, so
+ * a page pulling dozens of images and scripts at once is never touched.
+ */
+const LEVELS: Record<ProtectLevel, { rate: string; burst: number; conn: number; label: string }> = {
+    lenient: { rate: "40r/s", burst: 120, conn: 60, label: "40 requests a second per visitor" },
+    standard: { rate: "15r/s", burst: 45, conn: 30, label: "15 requests a second per visitor" },
+    strict: { rate: "5r/s", burst: 15, conn: 10, label: "5 requests a second per visitor" },
+};
+
+/** Per-site attack prevention. Absent means the site is served without any of it. */
+export interface Protection {
+    level: ProtectLevel;
+    /** Refuse requests from known scanners and attack tools (by User-Agent). */
+    blockTools?: boolean;
+    /** Refuse requests for files attackers probe for (.env, .git, database dumps). */
+    blockProbes?: boolean;
+    /** php: a much harder limit on login and XML-RPC endpoints. */
+    protectLogin?: boolean;
+}
+
+export const PROTECT_LEVELS = LEVELS;
+/** What a new website gets. */
+export const DEFAULT_PROTECTION: Protection = { level: "standard", blockTools: true, blockProbes: true, protectLogin: true };
+
+interface ProtectMeta {
+    /** Addresses and ranges exempt from every limit below. */
+    trusted: string[];
+}
+
+// Tools that exist to break into or map out a site. Browsers, feed readers,
+// search engine crawlers and ordinary API clients (curl, python-requests) are
+// deliberately not in here: this must not cost the site real traffic.
+const ATTACK_TOOLS = [
+    "sqlmap", "nikto", "nmap", "masscan", "zgrab", "nuclei", "dirbuster", "gobuster", "feroxbuster",
+    "wfuzz", "ffuf", "wpscan", "joomscan", "droopescan", "acunetix", "netsparker", "arachni", "nessus",
+    "openvas", "metasploit", "havij", "jorgee", "zmeu", "morfeus", "cgichk", "whatweb", "xmlrpc brute",
+    "libwww-perl", "netcrawler", "mj12bot",
+].join("|");
+
+/** Files and folders that only an attacker asks for; never part of a working site. */
+const PROBE_PATHS = "(?:^|/)\\.(?:env|git|svn|hg|aws|ssh|htpasswd)(?:/|$)|^/vendor/(?:phpunit|composer)/|^/(?:wp-config|configuration|settings)\\.php[.~]|\\.(?:sql|sqlite|dump|bak|old|orig|save|swp|rdb|pem|key)$";
+
+/** Endpoints attackers hammer with password guesses. */
+const LOGIN_PATHS = "^/(?:wp-login\\.php|xmlrpc\\.php|wp-json/wp/v2/users|administrator/index\\.php|user/login|admin/login(?:\\.php)?)$";
+
+function readProtectMeta(): ProtectMeta {
+    try {
+        const m = JSON.parse(readFileSync(PROTECT_META, "utf8")) as ProtectMeta;
+        return { trusted: Array.isArray(m.trusted) ? m.trusted.filter((t) => TRUSTED.test(t)) : [] };
+    } catch {
+        return { trusted: [] };
+    }
+}
+
+/**
+ * The http-level part of attack prevention: the counters sites share and the
+ * tests a request is measured against. Everything is keyed per site and per
+ * address, so one site being attacked never costs another site its visitors,
+ * and a trusted address gets an empty key, which nginx does not count at all.
+ */
+function includeText(): string {
+    const trusted = readProtectMeta().trusted;
+    const zones = (Object.keys(LEVELS) as ProtectLevel[])
+        .map((l) => `limit_req_zone $kiwin_limit_key zone=kiwin_${l}:10m rate=${LEVELS[l].rate};`)
+        .join("\n");
+    return `# Managed by kiwi: websites from user storage (/www/nginx/sites).
 map $http_upgrade $kiwin_connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+# ---- Attack prevention (Websites > website > Attack prevention) ----
+# Addresses that are never limited: this server itself, plus whatever was added
+# in the panel. Their limit key is empty below, which nginx leaves uncounted.
+geo $kiwin_trusted {
+    default 0;
+    127.0.0.0/8 1;
+    ::1 1;
+${trusted.map((t) => `    ${t} 1;\n`).join("")}}
+map $kiwin_trusted $kiwin_limit_key {
+    0 "$server_name$binary_remote_addr";
+    1 "";
+}
+map $http_user_agent $kiwin_attack_tool {
+    default 0;
+    "~*(?:${ATTACK_TOOLS})" 1;
+}
+${zones}
+# Password guessing is slow traffic, so it gets its own, much tighter counter.
+limit_req_zone $kiwin_limit_key zone=kiwin_login:10m rate=20r/m;
+limit_conn_zone $kiwin_limit_key zone=kiwin_conn:10m;
+# 429 tells well-behaved clients (and search engines) to come back later.
+limit_req_status 429;
+limit_conn_status 429;
+# At error level the refusals land in the site's own error log, which the panel shows.
+limit_req_log_level error;
+
 include ${SITES_CONF_DIR}/*.conf;
 `;
+}
 
 export const certPaths = (domain: string) => ({
     dir: join(CERT_DIR, domain),
@@ -87,12 +192,63 @@ const hasCert = (site: Site) => !!site.ssl && existsSync(certPaths(site.domain).
 /** The site's own locked-down pool; the shared one only for PHP from the system image. */
 const phpSocket = (site: Site) => (KiwiPhp.hasSitePools(site.php) ? KiwiPhp.siteSocket(site.php, site.domain) : KiwiPhp.socket(site.php!));
 
+/**
+ * Server-level attack prevention. The limits count one address at a time, so a
+ * flood from a single source runs into them long before a visitor browsing the
+ * site does; the timeouts drop connections that are opened only to be held
+ * open (slowloris), which costs normal clients nothing.
+ */
+function protectServer(site: Site): string {
+    const p = site.protect;
+    if (!p) return "";
+    const l = LEVELS[p.level] ?? LEVELS.standard;
+    const tools = p.blockTools
+        ? `\n    # Known scanners and attack tools, by User-Agent.\n    if ($kiwin_attack_tool) {\n        return 403;\n    }\n`
+        : "";
+    return `    # Attack prevention: ${l.label}, ${l.conn} connections at a time.
+    limit_req zone=kiwin_${p.level} burst=${l.burst} nodelay;
+    limit_conn kiwin_conn ${l.conn};
+    client_header_timeout 20s;
+    client_body_timeout 20s;
+    send_timeout 30s;
+${tools}
+`;
+}
+
+/** Location blocks that must come before the site's own: probes and login endpoints. */
+function protectLocations(site: Site): string {
+    const p = site.protect;
+    if (!p) return "";
+    let out = "";
+    if (p.blockProbes) {
+        out += `    # Files only an attacker asks for; answered without touching the site.
+    location ~* "${PROBE_PATHS}" {
+        access_log off;
+        deny all;
+    }
+
+`;
+    }
+    if (p.protectLogin && site.type === "php") {
+        out += `    # Password guessing: a few tries a minute, then 429.
+    location ~* "${LOGIN_PATHS}" {
+        limit_req zone=kiwin_login burst=5 nodelay;
+        limit_conn kiwin_conn ${(LEVELS[p.level] ?? LEVELS.standard).conn};
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${phpSocket(site)};
+    }
+
+`;
+    }
+    return out;
+}
+
 function siteBody(site: Site): string {
     const root = `    root ${siteRoot(site.domain)};`;
     const dotfiles = `    location ~ /\\.(?!well-known) {\n        deny all;\n    }`;
     switch (site.type) {
         case "proxy":
-            return `    location / {
+            return `${protectLocations(site)}    location / {
         proxy_pass ${site.proxy};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -106,7 +262,7 @@ function siteBody(site: Site): string {
             return `${root}
     index index.php index.html index.htm;
 
-    location / {
+${protectLocations(site)}    location / {
         try_files $uri $uri/ /index.php?$query_string;
     }
 
@@ -120,7 +276,7 @@ ${dotfiles}`;
             return `${root}
     index index.html index.htm;
 
-    location / {
+${protectLocations(site)}    location / {
         try_files $uri $uri/ =404;
     }
 
@@ -142,7 +298,7 @@ server {
     server_name ${names};
 ${logs}
 
-${acme}
+${protectServer(site)}${acme}
 
 ${redirect ? "    location / {\n        return 301 https://$host$request_uri;\n    }" : siteBody(site)}
 }
@@ -161,7 +317,7 @@ server {
     ssl_session_timeout 1d;
 ${site.forceHttps ? '    add_header Strict-Transport-Security "max-age=31536000" always;\n' : ""}${logs}
 
-${acme}
+${protectServer(site)}${acme}
 
 ${siteBody(site)}
 }
@@ -209,8 +365,10 @@ export class KiwiNginx {
         chmodSync(CERT_DIR, 0o700);
         chmodSync(WEB_DIR, 0o755);
         if (!existsSync(META)) writeFileSync(META, "[]\n", { mode: 0o600 });
-        if (existsSync("/etc/nginx/conf.d") && (!existsSync(INCLUDE_FILE) || readFileSync(INCLUDE_FILE, "utf8") !== INCLUDE)) {
-            writeFileSync(INCLUDE_FILE, INCLUDE, { mode: 0o644 });
+        if (!existsSync(PROTECT_META)) writeFileSync(PROTECT_META, JSON.stringify({ trusted: [] }, null, 2) + "\n", { mode: 0o600 });
+        const include = includeText();
+        if (existsSync("/etc/nginx/conf.d") && (!existsSync(INCLUDE_FILE) || readFileSync(INCLUDE_FILE, "utf8") !== include)) {
+            writeFileSync(INCLUDE_FILE, include, { mode: 0o644 });
         }
     }
 
@@ -268,6 +426,7 @@ export class KiwiNginx {
             ...(type === "php" ? { php: target } : {}),
             enabled: true,
             createdAt: new Date().toISOString(),
+            protect: { ...DEFAULT_PROTECTION },
         };
         // New static/PHP sites get a welcome page; undo that if nginx rejects the change.
         const siteDir = join(WEB_DIR, domain);
@@ -370,6 +529,38 @@ export class KiwiNginx {
         if (stale && !(await this.apply(all))) console.error(`nginx: moving PHP sites to their own pools failed: ${this.lastError}`);
     }
 
+    /**
+     * Turn attack prevention on (or change it) for a site; null switches it off
+     * and the site is served exactly as before the feature existed.
+     */
+    static async setProtection(domain: string, protect: Protection | null): Promise<boolean> {
+        if (protect && !(protect.level in LEVELS)) return this.fail(`Unknown protection level: ${protect.level}`);
+        return this.update(domain, (s) => {
+            if (protect) s.protect = protect;
+            else delete s.protect;
+        });
+    }
+
+    /** Addresses and ranges exempt from every limit, shared by all websites. */
+    static trusted(): string[] {
+        return readProtectMeta().trusted;
+    }
+
+    /** Replace the exempt addresses; applied to nginx the same way a site change is. */
+    static async setTrusted(list: string[]): Promise<boolean> {
+        this.lastError = null;
+        const clean = [...new Set(list.map((t) => t.trim()).filter(Boolean))];
+        const bad = clean.find((t) => !TRUSTED.test(t));
+        if (bad) return this.fail(`Not an address or range: ${bad}`);
+        if (clean.length > 200) return this.fail("Too many addresses (200 at most)");
+        this.ensure();
+        const before = readFileSync(PROTECT_META, "utf8");
+        writeFileSync(PROTECT_META, JSON.stringify({ trusted: clean }, null, 2) + "\n", { mode: 0o600 });
+        const ok = await this.apply(this.list());
+        if (!ok) writeFileSync(PROTECT_META, before, { mode: 0o600 });
+        return ok;
+    }
+
     /** Record an issued certificate (files already written to certPaths). */
     static async setSsl(domain: string, ssl: Site["ssl"]): Promise<boolean> {
         return this.update(domain, (s) => { s.ssl = ssl; });
@@ -465,6 +656,8 @@ export class KiwiNginx {
     /** Write sites.json + regenerate all server blocks, keep them only if `nginx -t` passes. */
     private static async apply(sites: Site[]): Promise<boolean> {
         if (!this.isInstalled()) return this.fail("nginx is not installed in the system image");
+        // ensure() rewrites the shared include from protect.json; keep the old one to undo with.
+        const oldInclude = existsSync(INCLUDE_FILE) ? readFileSync(INCLUDE_FILE, "utf8") : null;
         this.ensure();
         // Sites made before the web root was renamed: move public/ to public_html/ once
         // (moved back below if nginx rejects the new configuration).
@@ -512,6 +705,7 @@ export class KiwiNginx {
         }
         const undo = () => {
             write(backup, oldMeta);
+            if (oldInclude !== null) writeFileSync(INCLUDE_FILE, oldInclude, { mode: 0o644 });
             for (const d of moved) renameSync(siteRoot(d), join(WEB_DIR, d, "public"));
         };
         // PHP sites' pools change with them: checked first, reloaded only once nginx agrees.

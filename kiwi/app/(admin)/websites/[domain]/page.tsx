@@ -1,13 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowUpRight, FolderOpen, Lock, LockOpen, Power, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowUpRight, FolderOpen, Lock, LockOpen, Power, Shield, ShieldCheck, Trash2 } from "lucide-react";
 import { ActionForm, SubmitButton } from "@/components/forms";
-import { HttpsBadge, TypeBadge, siteTarget } from "@/components/site-badges";
+import { HttpsBadge, ProtectionBadge, TypeBadge, siteTarget } from "@/components/site-badges";
 import { KiwiAcme } from "@/lib/acme";
-import { KiwiNginx } from "@/lib/nginx";
+import { KiwiNginx, PROTECT_LEVELS, type ProtectLevel } from "@/lib/nginx";
 import { requireUser } from "@/lib/session";
-import { setSitePhpSecurity, sitePhpWriteAccess, issueCertificate, reloadNginx, removeSite, resetSiteConfig, saveSiteConfig, setForceHttps, setSiteEnabled, testNginx } from "@/app/actions";
+import { setSitePhpSecurity, setSiteProtection, setTrustedAddresses, sitePhpWriteAccess, issueCertificate, reloadNginx, removeSite, resetSiteConfig, saveSiteConfig, setForceHttps, setSiteEnabled, testNginx } from "@/app/actions";
 import { CodeEditor } from "@/components/code-editor";
 import { JobLog } from "@/components/job-log";
 import { KiwiJobs } from "@/lib/jobs";
@@ -28,6 +28,8 @@ export default async function Website({ params, searchParams }: Props) {
     const secured = KiwiNginx.hasCert(site);
     const url = `${secured ? "https" : "http"}://${site.domain}`;
     const config = KiwiNginx.config(domain)!;
+    const protect = site.protect;
+    const trusted = KiwiNginx.trusted();
     // The job from the link, or one still running after a reload.
     const linked = flags.job ? KiwiJobs.get(flags.job) : null;
     const job = linked?.key === `ssl:${domain}` ? linked : KiwiJobs.running(`ssl:${domain}`);
@@ -41,6 +43,7 @@ export default async function Website({ params, searchParams }: Props) {
                     <div className="row" style={{ marginTop: 8 }}>
                         <TypeBadge site={site} />
                         <HttpsBadge site={site} secured={secured} />
+                        <ProtectionBadge site={site} />
                         <span className="status"><span className={site.enabled ? "dot dot-ok" : "dot"} aria-hidden />{site.enabled ? "Enabled" : "Disabled"}</span>
                     </div>
                 </div>
@@ -135,6 +138,56 @@ export default async function Website({ params, searchParams }: Props) {
                     )}
                 </section>
             )}
+
+            <section className="card" style={{ marginTop: 16 }}>
+                <h2><Shield size={17} aria-hidden /> Attack prevention</h2>
+                <p className="hint">
+                    Spam and brute-force traffic looks like one source asking for far more, far faster, than a person browsing does. nginx counts requests
+                    per visitor for this website alone and answers the excess with <code>429 Too Many Requests</code> instead of running the site for it.
+                    A normal page load — a document plus its images, styles and scripts — arrives in one burst and is never slowed down.
+                    {config.custom && " This website has a hand-edited configuration, so these settings don't reach it until it is reset to the generated one."}
+                </p>
+                <ActionForm action={setSiteProtection.bind(null, site.domain)} className="stack">
+                    <label><span className="label-text">How much one visitor may ask for</span>
+                        <select name="level" defaultValue={protect?.level ?? "off"}>
+                            <option value="off">Off · no limits at all</option>
+                            {(Object.keys(PROTECT_LEVELS) as ProtectLevel[]).map((l) => (
+                                <option key={l} value={l}>
+                                    {l[0].toUpperCase() + l.slice(1)} · {PROTECT_LEVELS[l].label}, {PROTECT_LEVELS[l].conn} connections at a time
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="check">
+                        <input type="checkbox" name="blockTools" defaultChecked={protect ? !!protect.blockTools : true} />
+                        <span>Refuse known attack tools <span className="opt">· sqlmap, nikto, nuclei, wpscan and similar scanners, by User-Agent. Browsers, feed readers and search engine crawlers are not touched.</span></span>
+                    </label>
+                    <label className="check">
+                        <input type="checkbox" name="blockProbes" defaultChecked={protect ? !!protect.blockProbes : true} />
+                        <span>Refuse probes for secrets <span className="opt">· <code>.env</code>, <code>.git</code>, <code>.ssh</code>, leftover <code>wp-config.php.bak</code>, database dumps and key files.</span></span>
+                    </label>
+                    {site.type === "php" && (
+                        <label className="check">
+                            <input type="checkbox" name="protectLogin" defaultChecked={protect ? !!protect.protectLogin : true} />
+                            <span>Slow down password guessing <span className="opt">· 20 tries a minute per visitor on <code>wp-login.php</code>, <code>xmlrpc.php</code> and similar login endpoints.</span></span>
+                        </label>
+                    )}
+                    <div><SubmitButton variant="secondary">Save</SubmitButton></div>
+                </ActionForm>
+                <p className="hint" style={{ marginTop: 10 }}>
+                    Start at Standard; move to Strict only for a site under attack, and to Lenient if an app of yours (a dashboard polling an API, say) is being refused.
+                    Refusals are logged as <code>limiting requests</code> in the error log above, so you can see whether real traffic is hitting them.
+                </p>
+                <div className="sw-service">
+                    <p className="hint">Addresses that no limit applies to — your office, an uptime monitor, a payment provider&apos;s callbacks. One per line, as an address or a range (<code>203.0.113.7</code>, <code>203.0.113.0/24</code>). This list is shared by every website.</p>
+                    <ActionForm action={setTrustedAddresses} className="stack">
+                        <label><span className="label-text">Never limited <span className="opt">(optional)</span></span>
+                            <textarea name="trusted" rows={3} defaultValue={trusted.join("\n")} placeholder="203.0.113.7&#10;203.0.113.0/24" autoCapitalize="none" spellCheck={false} />
+                        </label>
+                        <div><SubmitButton variant="secondary">Save addresses</SubmitButton></div>
+                    </ActionForm>
+                </div>
+            </section>
 
             <section className="card" style={{ marginTop: 16 }}>
                 <h2>Manage</h2>
